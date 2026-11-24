@@ -110,7 +110,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -322,7 +322,8 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    let split_wave = native.stage == HwStage::Cs && native.wave64 && host_max_wave() == 32;
+    if stuck && split_wave {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -361,9 +362,16 @@ pub fn emit(
                 Some((p, st, io, res))
             })
         };
+        let edges = threading::constant_edges(p, st);
+        let threaded = if edges.is_empty() {
+            None
+        } else {
+            ir::thread_edges(p, &edges).ok()
+        };
         let forms = [
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
+            ("with constant edges threaded", form(threaded)),
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
@@ -468,6 +476,7 @@ pub fn emit(
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
+                && !split_wave
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
@@ -479,7 +488,16 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let accept = |(shader, wave)| {
+        if split_wave && wave == Some(64) {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "console wave64 could not be translated for a 32-lane host",
+            });
+        }
+        Ok(shader)
+    };
+    let original = original.and_then(accept);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -493,7 +511,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(accept)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

@@ -62,6 +62,7 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 for name in [
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_LOCAL",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
@@ -94,7 +95,13 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            // A translation cached for a wave64 adapter can contain WaveSize(64).
+            let mut key = blake3::Hasher::new();
+            key.update(build());
+            key.update(&victory_shader::emit::host_max_wave().to_le_bytes());
+            cached(cache, key.finalize().as_bytes(), container, translate)
+        }
         None => translate(container),
     }
 }

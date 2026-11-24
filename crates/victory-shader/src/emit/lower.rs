@@ -304,6 +304,8 @@ struct Lower<'a> {
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
+const INTERPOLATION_FIRST_HALF: &str = "the first half of an interpolation";
+
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
@@ -7038,9 +7040,12 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // A first interpolation half folded into P2 has no
+                // standalone value. Do not read the register from before P1.
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    None | Some(Err(INTERPOLATION_FIRST_HALF)) => self.s.m.i32(0),
+                    Some(Err(why)) => return Err(why),
                 };
                 let h = self
                     .s
@@ -8538,7 +8543,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(INTERPOLATION_FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {

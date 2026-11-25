@@ -6,9 +6,8 @@
 //! copied into the host texture.
 //!
 //! "Changed" means a page of the memory was written since the last detiling
-//! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! ([`crate::watch`]), in write-watched memory. For physical-page views,
+//! guard notifications and content hashes detect changes.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -19,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -28,6 +28,22 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Whether the sampled view's write guards can defer its next content hash.
+/// A decoder can write a linear R8 movie plane through another mapping of
+/// the same pages (ballade0d, fxceless/victory-fork#489). Setting
+/// `VICTORY_MOVIE_PLANES=0` restores the periodic check for comparison.
+fn guard_view(d: &D3D12_RESOURCE_DESC, swizzle: victory_formats::texture::Swizzle) -> bool {
+    static HASH_MOVIE_PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !(d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && swizzle == victory_formats::texture::Swizzle::LINEAR
+        && *HASH_MOVIE_PLANES.get_or_init(|| {
+            std::env::var_os("VICTORY_MOVIE_PLANES").is_none_or(|value| value != "0")
+        }))
 }
 
 /// A texture's upload state: the staging buffer laid out as the host
@@ -46,6 +62,8 @@ pub(crate) struct Staging {
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
+    /// Whether unchanged view guards can defer hashing this texture.
+    guard_view: bool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -647,7 +665,8 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+        if self.guard_view
+            && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
@@ -1004,6 +1023,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let guard_view = guard_view(&d, layout.desc.swizzle);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1046,6 +1066,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         bytes: total,
         memory,
+        guard_view,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
@@ -1058,6 +1079,152 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    /// A decoder writes one mapping while the sampled plane holds another
+    /// mapping of the same physical bytes. Compare the old and new refresh
+    /// paths between guard polling turns, using a real D3D upload buffer.
+    #[test]
+    fn linear_movie_plane_refreshes_after_an_alias_write() {
+        // The write-watch journal retains generation history by virtual address.
+        // Run the synthetic mappings in a child so address reuse cannot influence
+        // this regression or the independent tests of the journal.
+        const CHILD: &str = "VICTORY_MOVIE_PLANE_ALIAS_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "texture::title_memory_tests::linear_movie_plane_refreshes_after_an_alias_write", "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_TEXTURE_GUARD", "1")
+                .env("VICTORY_MOVIE_PLANES", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use super::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        const BLOCK: usize = 64 << 10;
+        const BYTES: usize = 2 * BLOCK;
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                crate::watch::title_memory_remapped(self.0.Value as usize, BYTES);
+                // SAFETY: the test owns this mapped view.
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        // SAFETY: fresh pagefile section and two writable views of its whole range.
+        let (sample, writer) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BYTES as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BYTES);
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BYTES);
+            CloseHandle(section);
+            assert!(!a.Value.is_null() && !b.Value.is_null());
+            (View(a), View(b))
+        };
+        let frame = crate::frame::current();
+        let off = if (frame + (sample.0.Value as u64 >> 16)).is_multiple_of(8) {
+            BLOCK
+        } else {
+            0
+        };
+        // SAFETY: both offsets select a whole block within the mapped section.
+        let from = unsafe { sample.0.Value.cast::<u8>().add(off) };
+        let through = unsafe { writer.0.Value.cast::<u8>().add(off) };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 16,
+            height: 1,
+            depth: 1,
+            mips: 1,
+            element_bytes: 1,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        assert!(layout.size <= BLOCK as u64);
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Format: DXGI_FORMAT_R8_UNORM,
+            MipLevels: 1,
+            DepthOrArraySize: 1,
+            ..Default::default()
+        };
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipping movie-plane staging readback");
+            return;
+        };
+        let (buffer, data) = host.upload_buffer(256).unwrap();
+        STAGED[0].fetch_add(1, Relaxed);
+        STAGED[1].fetch_add(256, Relaxed);
+        let mut stage = Staging {
+            buffer,
+            data,
+            layout,
+            memory: from,
+            guard_view: true,
+            mips: 1,
+            bytes: 256,
+            #[cfg(feature = "diagnostics")]
+            size: 256,
+            rows: vec![1],
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8_UNORM,
+                    Width: 16,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: 256,
+                },
+            }],
+            last: Default::default(),
+            dirty: false.into(),
+            uploaded: false.into(),
+            used: 0.into(),
+        };
+        // SAFETY: the writer alias and the mapped upload buffer remain live, and no GPU work is in flight.
+        unsafe {
+            through.write_volatile(17);
+            stage.refresh_now();
+            assert_eq!(data.read_volatile(), 17);
+            through.write_volatile(93);
+            stage.refresh_now();
+            assert_eq!(
+                data.read_volatile(),
+                17,
+                "the unmodified guard misses the alias write"
+            );
+            stage.guard_view = guard_view(&d, Swizzle::LINEAR);
+            stage.refresh_now();
+            assert_eq!(data.read_volatile(), 93);
+            through.write_volatile(218);
+            stage.refresh_now();
+            assert_eq!(data.read_volatile(), 218);
+        }
+        assert!(guard_view(&d, Swizzle::SW_64KB_S));
+        let mipmapped = D3D12_RESOURCE_DESC { MipLevels: 2, ..d };
+        assert!(guard_view(&mipmapped, Swizzle::LINEAR));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

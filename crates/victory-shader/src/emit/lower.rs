@@ -446,59 +446,248 @@ fn need(block: usize) {
     });
 }
 
-/// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
-/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
-/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
-/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
-/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+/// VGPR values that are the same in every lane of a console wave holding them (`all` is
+/// [`all_lane_blocks`]): written lane by lane from scalars, constants and such values, by an
+/// instruction that either every arriving lane runs or that runs under a condition itself the
+/// same in every lane of the console wave (then only over an old value that is such a value
+/// too: a wave the condition leaves out keeps that); loaded from LDS at such an address; or
+/// the thread id's x shifted right past the console wave (`wave_tid`, ids `>> 6` or more,
+/// where a console wave is one run of 64 ids along x). The compiler keeps wave-uniform data
+/// in VGPRs and fetches it with `v_readfirstlane`.
+/// A value joined by a phi counts where every predecessor is a block every lane of the console
+/// wave reaches together: no branch on a lane-dependent condition can have split them (a
+/// branch on such alike values does not). Loop-carried values count only when what the loop
+/// carries is made of such values; the analysis runs to a fixed point from nothing, so a value
+/// that needs itself to be alike never is.
+fn lane_uniform(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    wave_tid: Option<Value>,
+    fence_only: &HashSet<usize>,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
-        let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
-                same.insert(phi.value);
+    let settled = settled_shared_reads(p, fence_only);
+    let regions = lane_regions(st);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    loop {
+        // An atom of a lane condition that every lane of a console wave holds alike.
+        let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => same.contains(&v),
+            _ => false,
+        };
+        let alike_bool = |same: &HashSet<Value>, b: Bool| {
+            st.bools.support(b).iter().all(|a| alike_atom(same, a))
+        };
+        // Blocks every lane of a console wave reaches together: `all`, or reached only past
+        // branches on alike conditions.
+        let wave_all: Vec<bool> = match &regions {
+            Some(regions) => {
+                let mut w = vec![true; st.exits.len()];
+                for (d, region) in regions {
+                    let LaneExit::Branch { when, .. } = st.exits[*d] else {
+                        continue;
+                    };
+                    if alike_bool(&same, when) {
+                        continue;
+                    }
+                    for (b, r) in region.iter().enumerate() {
+                        if *r {
+                            w[b] = false;
+                        }
+                    }
+                }
+                w
+            }
+            None => all.to_vec(),
+        };
+        let mut next: HashSet<Value> = HashSet::new();
+        for &b in &order {
+            let block = &p.blocks[b];
+            let whole = block
+                .preds
+                .iter()
+                .all(|&q| wave_all.get(q).copied().unwrap_or(false));
+            for phi in &block.phis {
+                if matches!(phi.reg, Reg::V(_))
+                    && whole
+                    && phi
+                        .args
+                        .iter()
+                        .all(|a| next.contains(a) || same.contains(a))
+                {
+                    next.insert(phi.value);
+                }
+            }
+            let known = |next: &HashSet<Value>, x: &Value| next.contains(x) || same.contains(x);
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                // under a condition: only one every lane of the console wave holds alike, and
+                // over an old value that is alike too
+                if let Some(g) = st.guards[b][i] {
+                    if !alike_bool(&same, g) {
+                        continue;
+                    }
+                    let old_alike = inst
+                        .writes
+                        .iter()
+                        .filter(|w| matches!(w.0, Reg::V(_)))
+                        .all(|w| inst.read(w.0).is_none_or(|old| known(&next, &old)));
+                    if !old_alike {
+                        continue;
+                    }
+                }
+                // an LDS read at an alike address reads one value in every lane
+                if let Fields::Ds {
+                    addr: Some(Operand::Vector { reg, .. }),
+                    dst: Some(_),
+                    data,
+                    ..
+                } = &inst.fields
+                    && name == "ds_read_b32"
+                    && data.is_empty()
+                    && settled.contains(&(b, i))
+                {
+                    if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
+                        next.extend(
+                            inst.writes
+                                .iter()
+                                .filter(|w| matches!(w.0, Reg::V(_)))
+                                .map(|w| w.1),
+                        );
+                    }
+                    continue;
+                }
+                // Only these word operations read exactly their explicit operands. Swaps
+                // and accumulators also read the former destination, carry operations read
+                // a mask, and relative register moves read M0.
+                let Fields::Valu(v) = &inst.fields else { continue };
+                let arity = match name {
+                    "v_mov_b32" => 1,
+                    "v_add_nc_u32" | "v_lshlrev_b32" | "v_lshrrev_b32"
+                    | "v_cmp_eq_u32" | "v_cmp_ne_u32" | "v_cmp_lt_u32"
+                    | "v_cmp_le_u32" | "v_cmp_gt_u32" | "v_cmp_ge_u32" => 2,
+                    _ => continue,
+                };
+                if v.dpp.is_some() || v.sdwa.is_some() || v.carry.is_some() || v.src.len() != arity
+                    || v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.clamp || v.omod != 0
+                {
+                    continue;
+                }
+                let ops = &v.src;
+                // the thread id's x shifted past the console wave: one value per console wave
+                // GFX10 masks a 32-bit shift count to its low five bits.
+                if let (
+                    Some(tid),
+                    "v_lshrrev_b32",
+                    [Operand::Const(k), Operand::Vector { reg, .. }, ..],
+                ) = (wave_tid, name, ops.as_slice())
+                    && (128..=192).contains(k) && (k - 128) & 31 >= 6
+                    && inst.read(Reg::V(*reg)) == Some(tid)
+                {
+                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                    continue;
+                }
+                let alike = ops.iter().all(|op| match *op {
+                    Operand::Vector { reg, dwords: 1 } =>
+                        inst.read(Reg::V(reg)).is_some_and(|x| known(&next, &x)),
+                    Operand::Scalar { code, dwords: 1 } if code <= 105 => {
+                        inst.read(Reg::S(code)).is_some_and(|x| !is_mask(x))
+                    }
+                    Operand::Scalar { code: NULL, dwords: 1 } | Operand::Literal(_)
+                    | Operand::Const(128..=208 | 240..=248) => true,
+                    _ => false,
+                });
+                if alike {
+                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                }
             }
         }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
-                }
-                _ => continue,
-            };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
+        if next.is_subset(&same) {
+            return same;
+        }
+        same.extend(next);
+    }
+}
+
+/// The thread id's x (`v0` on entry) of a console wave64 compute program whose console waves are
+/// runs of 64 ids along x (a group 64-aligned along x, or one row): `id >> 6` and up is then one
+/// value per console wave ([`lane_uniform`]).
+fn wave_tid(p: &Program, x: &Parts<'_>) -> Option<Value> {
+    let StageIo::Cs(cs) = &x.native.io else {
+        return None;
+    };
+    let [tx, ty, tz] = cs.threads;
+    if !x.native.wave64 || !(tx % 64 == 0 || ty * tz == 1) {
+        return None;
+    }
+    p.inputs
+        .iter()
+        .find(|(r, _)| *r == Reg::V(0))
+        .map(|(_, v)| *v)
+}
+
+/// LDS reads reached only after a common group barrier, with no possible later write.
+/// The barrier must be on every path from entry to exit, even for waves taking different
+/// uniform branches. A fence without a group rendezvous cannot establish this property.
+fn settled_shared_reads(p: &Program, fence_only: &HashSet<usize>) -> HashSet<Site> {
+    let mut settled = HashSet::new();
+    if super::group_sync() == 0 {
+        return settled;
+    }
+    // Sites reachable from the start, stopping at the optional barrier site. Track whether
+    // a path terminates (including opaque exits) without first reaching that barrier.
+    let walk = |start: Site, stop: Option<Site>| {
+        let mut sites = HashSet::new();
+        let mut entries = HashSet::new();
+        let mut stack = vec![start];
+        let mut exits = false;
+        while let Some((b, from)) = stack.pop() {
+            if !entries.insert((b, from)) {
+                continue;
             }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+            let block = &p.blocks[b];
+            let end = stop.filter(|&(bb, ii)| bb == b && ii >= from).map(|(_, ii)| ii);
+            sites.extend((from..end.unwrap_or(block.insts.len())).map(|i| (b, i)));
+            if end.is_none() {
+                let next = block.exit.successors();
+                exits |= next.is_empty();
+                stack.extend(next.into_iter().map(|b| (b, 0)));
             }
+        }
+        (sites, exits)
+    };
+    let writes = |i: &Inst| match i.fields {
+        Fields::Buffer { lds: true, .. } | Fields::Flat { lds: true, .. } => true,
+        Fields::Ds { .. } => {
+            let n = i.name();
+            !(n.starts_with("ds_read") || n.starts_with("ds_swizzle") ||
+              n.starts_with("ds_permute") || n.starts_with("ds_bpermute") || n == "ds_nop")
+        }
+        _ => false,
+    };
+    for (b, block) in p.blocks.iter().enumerate() {
+        if super::group_sync() == 1 && fence_only.contains(&b) {
+            continue;
+        }
+        for (i, _) in block.insts.iter().enumerate().filter(|(_, i)| i.name() == "s_barrier") {
+            let (before, bypass) = walk((0, 0), Some((b, i)));
+            if bypass {
+                continue;
+            }
+            let (after, _) = walk((b, i + 1), None);
+            if after.iter().any(|&(bb, ii)| writes(&p.blocks[bb].insts[ii])) {
+                continue;
+            }
+            settled.extend(after.difference(&before).copied().filter(|&(bb, ii)| {
+                let read = &p.blocks[bb].insts[ii];
+                read.name() == "ds_read_b32" && matches!(read.fields, Fields::Ds { gds: false, .. })
+            }));
         }
     }
-    same
+    settled
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1507,7 +1696,7 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x), &fence_only),
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -11353,5 +11542,62 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    // Check the exact SSA value used by readfirstlane, including the value a masked
+    // destination keeps in lanes not written. These programs never execute on the GPU.
+    fn first_source_is_wave_uniform(body: &[u32]) -> bool {
+        let words = body.iter().copied().chain([0x7E22_0503, S_ENDPGM]); // readfirstlane s17, v3
+        let code: Vec<_> = words.flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let tid = p.inputs.iter().find(|(reg, _)| *reg == ir::Reg::V(0)).map(|(_, v)| *v);
+        let read = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.name() == "v_readfirstlane_b32").unwrap();
+        super::lane_uniform(&p, &st, &all, tid, &Default::default()).contains(&read.read(ir::Reg::V(3)).unwrap())
+    }
+
+    #[test]
+    fn first_active_lane_shift_uses_only_five_low_count_bits() {
+        for shift in [0, 5, 6, 31, 32, 33, 37, 38, 63, 64] {
+            let shift_tid = 0x2C06_0080 | shift; // v_lshrrev_b32 v3, shift, v0
+            assert_eq!(first_source_is_wave_uniform(&[shift_tid]), (shift & 31) >= 6, "shift {shift}");
+        }
+    }
+
+    #[test]
+    fn first_active_lane_guarded_constant_keeps_old_lane_specific_value() {
+        assert!(!first_source_is_wave_uniform(&[
+            0x7E06_0300, // v_mov_b32 v3, v0
+            0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+            0xBE8C_047E, // s_mov_b64 s[12:13], exec
+            0x7DAA_0E80, // v_cmpx_ne_u32 0, v7
+            0x7E06_0287, // v_mov_b32 v3, 7; wave zero keeps its thread ids
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ]));
+    }
+
+    #[test]
+    fn first_active_lane_swap_keeps_implicit_old_destination_lane_specific() {
+        assert!(!first_source_is_wave_uniform(&[
+            0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+            0x7E00_CB07, // v_swap_b32 v0, v7
+            0x7E06_0307, // v_mov_b32 v3, v7: the thread ID before the swap
+        ]));
+    }
+
+    #[test]
+    fn first_active_lane_only_uses_settled_shared_memory() {
+        let addr = 0x7E02_0200; // v_mov_b32 v1, s0
+        let write = [0xD834_0000, 0x0000_0201]; // ds_write_b32 v1, v2
+        let read = [0xD8D8_0000, 0x0300_0001]; // ds_read_b32 v3, v1
+        for (has_barrier, has_later_write, expected) in [(true, false, true), (false, false, false), (true, true, false)] {
+            let mut body = vec![addr];
+            body.extend(write);
+            if has_barrier { body.push(0xBF8A_0000); }
+            body.extend(read);
+            if has_later_write { body.extend(write); }
+            assert_eq!(first_source_is_wave_uniform(&body), expected, "barrier {has_barrier}, later write {has_later_write}");
+        }
     }
 }

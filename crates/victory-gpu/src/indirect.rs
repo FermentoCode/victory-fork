@@ -616,6 +616,32 @@ void main() {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn warp_times_relay_copies_after_the_existing_fence() {
+        let Some(mut warp) = WarpHarness::new() else {
+            eprintln!("no D3D12 WARP adapter");
+            return;
+        };
+        let clock = crate::host::relay_timing::Timestamps::new(&warp.device, &warp.queue).unwrap();
+        let (src, src_ptr, _) = warp.shared_buffer(65536);
+        let (dst, dst_ptr, _) = warp.shared_buffer(65536);
+        for byte in [1, 2] {
+            // SAFETY: both buffers are idle; reading follows the fence.
+            unsafe {
+                src_ptr.write_bytes(byte, 65536);
+                clock.start(&warp.list);
+                warp.list.CopyBufferRegion(&dst, 0, &src, 0, 65536);
+                clock.finish(&warp.list);
+                warp.submit_and_wait();
+                assert!(std::slice::from_raw_parts(dst_ptr, 65536).iter().all(|&b| b == byte));
+            }
+            let ms = clock.read(&warp.fence, warp.submitted).expect("resolved GPU timestamps");
+            eprintln!("WARP 64 KiB relay copy, sample {byte}: {ms:.6} GPU ms");
+            assert!(clock.read(&warp.fence, warp.submitted + 1).is_none());
+        }
+    }
+
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.

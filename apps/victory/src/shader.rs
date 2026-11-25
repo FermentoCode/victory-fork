@@ -42,14 +42,38 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let remaining = &data[offset..];
+        let container = Container::parse(remaining).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: &remaining[..container.byte_len],
+        })
+    });
     out.extend(raw);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_containers_keep_their_standalone_identity() {
+        let mut header = [0u8; 32];
+        header[..4].copy_from_slice(b"DXBC");
+        header[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let mut file = b"prefix".to_vec();
+        file.extend(header);
+        file.extend(b"gap");
+        file.extend(header);
+        file.extend(b"unrelated trailing data");
+        let found = sources(&file);
+        assert_eq!(found.len(), 2);
+        for source in found {
+            assert_eq!(source.bytes().unwrap().as_ref(), header);
+        }
+    }
 }
 
 #[derive(Default)]

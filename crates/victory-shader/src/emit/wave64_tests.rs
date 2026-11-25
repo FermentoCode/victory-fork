@@ -450,3 +450,323 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A spilled 64-thread wave64 compute program dispatched with `DispatchX`
+/// `USE_THREAD_DIMENSIONS` (`USER_DISPATCH_THREADS`): reads `s_bcnt1_i32_b64(exec)`
+/// on entry, computes a whole-wave OR of `1 << (lane >> 1)`, and stores
+/// `(popcnt, wave_or)` unconditionally at `uav[lane * 2..+2]`.
+///
+/// Verified for both host wave sizes:
+/// - `host_max_wave = 64`: entry early-exit masks hardware `EXEC` before `B0`
+///   so `s_bcnt1_i32_b64(exec)` and the wave OR see only lanes `< limit`, and
+///   lanes `>= limit` never store.
+/// - `host_max_wave = 32`: predicated mode keeps both 32-lane host waves alive
+///   for `exchange_halves` barriers (no hang even at `limit = 1` where the
+///   upper half has zero active lanes) while masking ballots, reductions, and
+///   stores identically.
+#[test]
+fn spilled_compute_masks_partial_dispatch_threads_on_wave64_and_wave32() {
+    let mut words = vec![
+        // Read descriptor-table offset (user_data 16) from spilled table s[0:1] + 0.
+        0x8703_FF01,
+        0x0000_00FF, // s_and_b32 s3, s1, 0xff
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0x3D << 26 | 4 << 6 | 1,
+        125 << 25, // s_load_dword s4, s[2:3], 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x3402_0083, // v_lshlrev_b32 v1, 3, v0 (lane * 8 bytes)
+        0x7E04_0206, // v_mov_b32 v2, s6 (popcnt(exec))
+        0x7E06_0207, // v_mov_b32 v3, s7 (wave OR)
+        0x38 << 26 | 0x1D << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 1, // buffer_store_dwordx2 v[2:3], v1, s[8:11], 0 offen
+        S_ENDPGM,
+    ]);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 16,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 16,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1, // s0..s1 spilled table pointer
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = crate::spill::build(&native).expect("spill::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).ok();
+    for host_wave in [64u32, 32] {
+        let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.unwrap_or_else(|e| panic!("lower (host_wave={host_wave}): {e}"));
+        assert!(
+            lowered
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS) && u.dword == 0),
+            "host_wave={host_wave}: missing USER_DISPATCH_THREADS(0)"
+        );
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views.clone(),
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy)
+                .unwrap_or_else(|e| panic!("DXIL validation failed (host_wave={host_wave}): {e}"));
+        }
+        let Some(host) = host.as_ref() else { continue };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("device skipped host_wave={host_wave} pipeline");
+            continue;
+        };
+        for (limit, active, expected_or) in [
+            (45u32, 45usize, 0x007F_FFFFu32),
+            (1, 1, 1),
+            (0, 64, u32::MAX),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Other(super::USER_DISPATCH_THREADS) && u.dword == 0 {
+                    ud[u.index as usize] = limit;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(128)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed (host_wave={host_wave}, limit={limit}): {e}"));
+            for lane in 0..64 {
+                let (got_cnt, got_or) = (out[0][lane * 2], out[0][lane * 2 + 1]);
+                if lane < active {
+                    assert_eq!(
+                        (got_cnt, got_or),
+                        (active as u32, expected_or),
+                        "host_wave={host_wave} limit={limit} lane={lane}"
+                    );
+                } else {
+                    assert_eq!(
+                        (got_cnt, got_or),
+                        (0, 0),
+                        "host_wave={host_wave} limit={limit}: inactive lane {lane} stored!"
+                    );
+                }
+            }
+        }
+        eprintln!("ran on the hardware device (host_wave={host_wave}): partial dispatch limits 45, 1, 0 exact");
+    }
+}
+
+#[test]
+fn dispatchx_wave32_padding_lanes_do_not_write() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for barrier in [false, true] {
+        let mut words = vec![
+            0x7e10_0202, // v_mov_b32 v8, s2 (group ID x)
+            0x3410_1085, // v_lshlrev_b32 v8, 5, v8 (group base)
+            0x4a10_1100, // v_add_nc_u32 v8, v0, v8 (global lane)
+            0x8703_ff01,
+            0x0000_00ff, // s_and_b32 s3, s1, 0xff
+            0xbe82_0300, // s_mov_b32 s2, s0
+            0x3d << 26 | 4 << 6 | 1,
+            125 << 25,   // s_load_dword s4, s[2:3], 0
+            0xbe85_0380, // s_mov_b32 s5, 0
+            0x3d << 26 | 2 << 18 | 8 << 6 | 2,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        if barrier {
+            words.push(0xbf8a_0000); // s_barrier
+        }
+        words.extend_from_slice(&[
+            0x3402_1082, // v_lshlrev_b32 v1, 2, v8 (byte offset)
+            0x4a04_1081, // v_add_nc_u32 v2, 1, v8 (nonzero lane tag)
+            0xe070_1000,
+            0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+            S_ENDPGM,
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 16,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (2 << 1) | (1 << 7),
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let p = crate::spill::build(&native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let limit = lowered
+            .user_data
+            .iter()
+            .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS) && u.dword == 0)
+            .expect("shader must consume the dispatch thread limit")
+            .index;
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: vec![],
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        for warp in [true, false] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("DispatchX Wave32 test adapter unavailable (warp={warp})");
+                continue;
+            };
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+                IDXGIAdapter1, IDXGIFactory4,
+            };
+            // SAFETY: query the adapter belonging to this device by its LUID.
+            let desc = unsafe {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+                let adapter: IDXGIAdapter1 = factory
+                    .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                    .unwrap();
+                adapter.GetDesc1().unwrap()
+            };
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) != warp {
+                eprintln!("DispatchX Wave32 test adapter unavailable (software override)");
+                continue;
+            }
+            let adapter_name =
+                String::from_utf16_lossy(desc.Description.split(|&c| c == 0).next().unwrap());
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            for requested in [1u32, 32, 35, 64, 872, 896] {
+                let groups = requested.div_ceil(32);
+                let launched = groups * 32;
+                let thread_limit = if requested == launched { 0 } else { requested };
+                // Enough output for every rounded-up lane plus four trailing canaries.
+                // Wrongly active padded lanes must be observable in bounds.
+                // The zeroed raw UAV makes every nonzero lane tag observable.
+                let output_words = launched + 4;
+                let mut user = vec![0; shader.user_data_dwords() as usize];
+                user[limit as usize] = thread_limit;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(user))],
+                            views: &[View::RawUav(output_words)],
+                            samplers: &[],
+                            groups: [groups, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].len(), output_words as usize);
+                for (i, &actual) in out[0].iter().enumerate() {
+                    let expected = if i < requested as usize {
+                        i as u32 + 1
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "adapter={adapter_name}, barrier={barrier}, requested={requested}, lane={i}"
+                    );
+                }
+                eprintln!(
+                    "adapter={adapter_name:?} barrier={barrier} requested={requested} cap={thread_limit} groups={groups} tagged={requested} padding_untouched={} guard_untouched=4",
+                    launched - requested
+                );
+            }
+        }
+    }
+}

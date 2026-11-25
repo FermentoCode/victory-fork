@@ -198,6 +198,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Raw thread counts `[x, y, z]` for a partial `DispatchX` call with
+    /// `USE_THREAD_DIMENSIONS` (`0` along an axis means full groups / no cap).
+    dispatch_threads: [u32; 3],
 }
 
 impl Drop for State {
@@ -679,9 +682,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_DISPATCH_THREADS {
+            return self.dispatch_threads.get(dword as usize).copied().unwrap_or(0);
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1665,6 +1673,20 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_inner(list, x, y, z, 0);
+    }
+
+    /// Runs a console `DispatchX(x, y, z, flags)` on the host.
+    ///
+    /// Bit 5 (`0x20`) of `COMPUTE_DISPATCH_INITIATOR` is
+    /// `USE_THREAD_DIMENSIONS`: `(x, y, z)` are raw thread counts rather than
+    /// thread-group counts, and trailing lanes of partial tail groups are
+    /// masked off in initial hardware `EXEC`.
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        self.dispatch_inner(list, x, y, z, flags);
+    }
+
+    fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1700,7 +1722,34 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let t = p.stages[0].translated();
+        let plan = dispatch_dimensions([x, y, z], t.threads, flags, |axis| {
+            t.host.user_data.iter().any(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS)
+                    && u.dword == axis as u32
+            })
+        });
+        let ([gx, gy, gz], partial) = match plan {
+            Ok(Some(dispatch)) => dispatch,
+            Ok(None) => return,
+            Err(reason) => {
+                once!(
+                    pipeline = %p.name, threads = ?[x, y, z], group = ?t.threads,
+                    ?reason, "thread-dimension dispatch dropped before binding"
+                );
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+                if crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("a dispatch could not enforce its thread dimensions");
+                }
+                return;
+            }
+        };
+        self.dispatch_threads = partial;
+        let bound = self.bind(list, p, true);
+        self.dispatch_threads = [0; 3];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1710,9 +1759,9 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2689,4 +2738,155 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// AMD GFX10 / console `COMPUTE_DISPATCH_INITIATOR` bit 5:
+/// `USE_THREAD_DIMENSIONS` (`DispatchX` arguments are raw thread counts rather
+/// than thread-group counts, with trailing lanes masked off in initial `EXEC`).
+const DISPATCH_USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchError {
+    UnknownGroupSize,
+    TooManyGroups(usize),
+    MissingMask(usize),
+}
+
+/// Converts console `Dispatch` / `DispatchX(x, y, z, flags)` dimensions to
+/// `(host_groups, partial_thread_limits)`. A zero thread count is empty.
+/// A partial axis must have its own translator-provided mask.
+fn dispatch_dimensions(
+    dims: [u32; 3],
+    group: [u32; 3],
+    flags: u32,
+    has_mask: impl Fn(usize) -> bool,
+) -> Result<Option<([u32; 3], [u32; 3])>, DispatchError> {
+    if flags & DISPATCH_USE_THREAD_DIMENSIONS == 0 {
+        return Ok(Some((dims, [0; 3])));
+    }
+    if dims.contains(&0) {
+        return Ok(None);
+    }
+    if group.contains(&0) {
+        return Err(DispatchError::UnknownGroupSize);
+    }
+    let mut groups = [0; 3];
+    let mut partial = [0; 3];
+    for i in 0..3 {
+        let g = group[i];
+        groups[i] = dims[i].div_ceil(g);
+        if groups[i] > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION {
+            return Err(DispatchError::TooManyGroups(i));
+        }
+        if g > 1 && !dims[i].is_multiple_of(g) {
+            if !has_mask(i) {
+                return Err(DispatchError::MissingMask(i));
+            }
+            partial[i] = dims[i];
+        }
+    }
+    Ok(Some((groups, partial)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marked_dispatch_checks_the_rounded_d3d12_group_limit_on_each_axis() {
+        let max = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+        for axis in 0..3 {
+            let mut dims = [2; 3];
+            let mut groups = [1; 3];
+            groups[axis] = max;
+            dims[axis] = max * 2;
+            assert_eq!(
+                dispatch_dimensions(dims, [2; 3], DISPATCH_USE_THREAD_DIMENSIONS, |_| false),
+                Ok(Some((groups, [0; 3])))
+            );
+            dims[axis] += 1;
+            assert_eq!(
+                dispatch_dimensions(dims, [2; 3], DISPATCH_USE_THREAD_DIMENSIONS, |_| true),
+                Err(DispatchError::TooManyGroups(axis))
+            );
+            assert_eq!(
+                dispatch_dimensions(dims, [2; 3], 0, |_| panic!()),
+                Ok(Some((dims, [0; 3])))
+            );
+        }
+    }
+
+    #[test]
+    fn marked_dispatch_requires_known_dimensions_and_every_partial_axis_mask() {
+        let group = [8, 8, 4];
+        let raw = DISPATCH_USE_THREAD_DIMENSIONS;
+        assert_eq!(
+            dispatch_dimensions([10, 16, 5], group, raw, |axis| axis == 0),
+            Err(DispatchError::MissingMask(2))
+        );
+        assert_eq!(
+            dispatch_dimensions([10, 16, 5], group, raw, |axis| axis != 1),
+            Ok(Some(([2, 2, 2], [10, 0, 5])))
+        );
+        assert_eq!(
+            dispatch_dimensions([1, 1, 1], [32, 1, 1], raw, |_| false),
+            Err(DispatchError::MissingMask(0))
+        );
+        for unknown in [[0, 0, 0], [8, 0, 4]] {
+            assert_eq!(
+                dispatch_dimensions([16, 16, 8], unknown, raw, |_| true),
+                Err(DispatchError::UnknownGroupSize)
+            );
+            assert_eq!(
+                dispatch_dimensions([16, 16, 8], unknown, 0x8000, |_| panic!()),
+                Ok(Some(([16, 16, 8], [0; 3])))
+            );
+        }
+        assert_eq!(dispatch_dimensions([0, 16, 8], [0; 3], raw, |_| panic!()), Ok(None));
+        assert_eq!(
+            dispatch_dimensions([16, 16, 8], group, raw, |_| panic!()),
+            Ok(Some(([2, 2, 2], [0; 3])))
+        );
+    }
+
+    #[test]
+    fn dispatch_x_thread_dimensions_convert_to_groups_and_partial_limits() {
+        let dispatch_dimensions = |dims, group, flags| {
+            super::dispatch_dimensions(dims, group, flags, |_| true).unwrap()
+        };
+        // Normal Dispatch / DispatchX without bit 5 passes group counts through.
+        assert_eq!(
+            dispatch_dimensions([48, 1, 1], [64, 1, 1], 0),
+            Some(([48, 1, 1], [0, 0, 0]))
+        );
+        assert_eq!(
+            dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x8000),
+            Some(([48, 1, 1], [0, 0, 0]))
+        );
+        // Bit 5 (0x20 / 0x8020): raw thread counts -> ceil(threads / group) + partial limits.
+        assert_eq!(
+            dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x20),
+            Some(([1, 1, 1], [48, 0, 0]))
+        );
+        assert_eq!(
+            dispatch_dimensions([1, 1, 1], [64, 1, 1], 0x8020),
+            Some(([1, 1, 1], [1, 0, 0]))
+        );
+        assert_eq!(
+            dispatch_dimensions([65, 1, 1], [64, 1, 1], 0x20),
+            Some(([2, 1, 1], [65, 0, 0]))
+        );
+        // Exact multiple of group size needs no partial-lane limit.
+        assert_eq!(
+            dispatch_dimensions([128, 1, 1], [64, 1, 1], 0x20),
+            Some(([2, 1, 1], [0, 0, 0]))
+        );
+        // 3D partial dimensions.
+        assert_eq!(
+            dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20),
+            Some(([2, 2, 2], [10, 0, 5]))
+        );
+        // Zero threads along any axis is a no-op.
+        assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
 }

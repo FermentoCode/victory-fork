@@ -56,6 +56,8 @@ pub struct Part<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
+    /// Total number of bytes declared by the container header, including padding.
+    pub byte_len: usize,
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
@@ -100,6 +102,7 @@ impl<'a> Container<'a> {
             });
         }
         Ok(Container {
+            byte_len: total,
             digest,
             version,
             parts,

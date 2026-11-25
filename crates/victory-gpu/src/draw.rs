@@ -700,15 +700,14 @@ impl State {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
         }
-        // The title address of the buffer view at that dword of the table.
+        // The title address in the descriptor at that dword of the table.
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
+                .map_or(0, |view| crate::descriptor::host::shader_address(&view)),
             _ => 0,
         };
         if address == 0 {
-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+            once!(slot, dword, "a shader takes the address of a view with no known address: it reads 0");
         }
         if kind == USER_VIEW_ADDRESS {
             address as u32
@@ -2689,4 +2688,58 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_table_as_location_reaches_shader_constants() {
+        use victory_shader::emit::USER_VIEW_ADDRESS;
+        #[repr(align(256))]
+        struct Geometry([u8; 1024]);
+        let backing = Geometry([0; 1024]);
+        let base = backing.0.as_ptr() as u64;
+        let location = base + 256;
+        let mut slots = [[0u64; 4]; 6];
+        let table = slots.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let mut state = State::default();
+        state.roots(true).push(Root::Table(table));
+        let read = |dword| {
+            let lo = state.host_word(true, USER_VIEW_ADDRESS, 0, dword, None);
+            let hi = state.host_word(true, USER_VIEW_ADDRESS + 1, 0, dword, None);
+            u64::from(lo) | (u64::from(hi) << 32)
+        };
+        let mut desc = [0u32; 10];
+        desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[4] = location as u32;
+        desc[5] = (location >> 32) as u32;
+        crate::descriptor::create_srv(null, null, &desc, table + 32);
+        crate::descriptor::copy_simple(null, 1, table + 128, table + 32, 0);
+        assert_eq!(read(32), location);
+        assert_eq!(read(8), location);
+        assert_eq!(read(0), 0);
+        // A null texture has no address even if the same union bytes are nonzero.
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        crate::descriptor::create_srv(null, null, &desc, table + 128);
+        assert_eq!(read(32), 0);
+        // Replacing that same slot with a placed structured buffer returns
+        // the byte address of element two, not the base of its allocation.
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = 1024;
+        let mut placed = [0u32; 16];
+        placed[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        placed[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        placed[4] = 2;
+        placed[6] = 8;
+        placed[7] = 16;
+        placed[10] = base as u32;
+        placed[11] = (base >> 32) as u32;
+        crate::descriptor::create_placed_srv(null, &resource, &placed, table + 128);
+        assert_eq!(read(32), base + 32);
+    }
 }

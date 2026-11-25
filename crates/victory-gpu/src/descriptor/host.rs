@@ -1394,6 +1394,20 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+/// Address exposed in the shader constants for a fixed descriptor table slot.
+/// A resource-less acceleration-structure SRV directly carries the Location
+/// in the 64-bit view union. It supplies an address without a buffer extent.
+pub(crate) fn shader_address(view: &View) -> u64 {
+    match view {
+        View::Shader(0, Some(words))
+            if words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>
+        {
+            u64::from(words[4]) | (u64::from(words[5]) << 32)
+        }
+        _ => buffer_range(view).map_or(0, |(address, _)| address),
+    }
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {

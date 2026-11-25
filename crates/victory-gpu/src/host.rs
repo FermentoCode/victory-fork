@@ -5,6 +5,9 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+#[cfg(feature = "diagnostics")]
+pub(super) mod relay_timing;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -2323,6 +2326,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    #[cfg(feature = "diagnostics")]
+    timestamps: Option<relay_timing::Timestamps>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -2494,6 +2499,8 @@ fn late_line(frames: f64) {
         );
     }
     if relay() {
+        #[cfg(feature = "diagnostics")]
+        relay_timing::report(frames);
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
@@ -3219,6 +3226,16 @@ impl Host {
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
+                #[cfg(feature = "diagnostics")]
+                timestamps: if relay_timing::enabled() {
+                    let stamps = relay_timing::Timestamps::new(&self.device, &self.queue);
+                    if stamps.is_none() {
+                        tracing::warn!("relay GPU timestamps unavailable; fetch timing will count invalid samples");
+                    }
+                    stamps
+                } else {
+                    None
+                },
                 fence,
                 event,
                 sent: 0,
@@ -3299,6 +3316,8 @@ impl Host {
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let waiting = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut times = relay_timing::enabled().then_some([waiting; 4]);
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -3306,21 +3325,45 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                if let Some(stamps) = &f.timestamps {
+                    stamps.start(&list);
+                }
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                #[cfg(feature = "diagnostics")]
+                if let Some(stamps) = &f.timestamps {
+                    stamps.finish(&list);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
+                #[cfg(feature = "diagnostics")]
+                if let Some([before_lock, ..]) = &mut times {
+                    *before_lock = std::time::Instant::now();
+                }
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                if let Some([_, acquired, ..]) = &mut times {
+                    *acquired = std::time::Instant::now();
+                }
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
+                #[cfg(feature = "diagnostics")]
+                if let Some([_, _, before_wait, _]) = &mut times {
+                    *before_wait = std::time::Instant::now();
+                }
                 WaitForSingleObject(event, INFINITE);
+                #[cfg(feature = "diagnostics")]
+                if let Some([.., finished]) = &mut times {
+                    *finished = std::time::Instant::now();
+                }
                 Ok(after)
             })()
         };
@@ -3329,6 +3372,11 @@ impl Host {
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
         let us = waiting.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        if let Some(times) = times {
+            let gpu_ms = f.timestamps.as_ref().and_then(|stamps| stamps.read(&fence, sent));
+            relay_timing::record(gpu_ms, total, waiting, times);
+        }
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
@@ -5498,6 +5546,10 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        Self::readback_on(&self.device, size)
+    }
+
+    fn readback_on(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -5518,7 +5570,7 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a read-back buffer.
         let made = unsafe {
-            self.device.CreateCommittedResource(
+            device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,

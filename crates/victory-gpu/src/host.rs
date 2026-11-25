@@ -7,6 +7,8 @@
 
 #[cfg(feature = "diagnostics")]
 pub(super) mod relay_timing;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod queue_profile;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -715,6 +717,8 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    #[cfg(feature = "diagnostics")]
+    profile_samples: OnceLock<Mutex<queue_profile::Recording>>,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -1541,6 +1545,8 @@ struct CardRange {
 
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
+    #[cfg(feature = "diagnostics")]
+    profile_samples: Vec<queue_profile::Sample>,
     ranges: Vec<CardRange>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
@@ -2501,6 +2507,8 @@ fn late_line(frames: f64) {
     if relay() {
         #[cfg(feature = "diagnostics")]
         relay_timing::report(frames);
+        #[cfg(feature = "diagnostics")]
+        queue_profile::report();
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
@@ -2831,6 +2839,8 @@ impl Host {
                 let _ = prelude.set(self.make_prelude());
             }
             Ok(HostList {
+                #[cfg(feature = "diagnostics")]
+                profile_samples: OnceLock::new(),
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -3030,6 +3040,8 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut profile_samples = Vec::new();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3042,6 +3054,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let profile = queue_profile::begin(list, "host-upload-hash", queue_profile::Group::Host, String::new);
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3087,6 +3101,11 @@ impl Host {
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(profile) = profile {
+                        profile.finish(list);
+                        profile_samples.push(profile);
+                    }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3099,6 +3118,8 @@ impl Host {
         }
         drop(order);
         let mut plan = CardPlan {
+            #[cfg(feature = "diagnostics")]
+            profile_samples,
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
@@ -3148,6 +3169,8 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    let profile = queue_profile::begin(list, "host-compare", queue_profile::Group::Host, String::new);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3171,6 +3194,11 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(profile) = profile {
+                        profile.finish(list);
+                        plan.profile_samples.push(profile);
                     }
                     list.Close()?;
                     list.cast()
@@ -3318,6 +3346,8 @@ impl Host {
         let waiting = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let mut times = relay_timing::enabled().then_some([waiting; 4]);
+        #[cfg(feature = "diagnostics")]
+        let mut backlog = None;
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -3349,6 +3379,13 @@ impl Host {
                 if let Some([_, acquired, ..]) = &mut times {
                     *acquired = std::time::Instant::now();
                 }
+                #[cfg(feature = "diagnostics")]
+                if queue_profile::enabled() {
+                    // A concurrent submitter may enqueue further work after
+                    // the snapshot. Only previously published fences qualify.
+                    let signalled = queue_profile::LAST_TITLE_FENCE.load(Ordering::Acquire);
+                    backlog = Some((self.fence.GetCompletedValue(), signalled));
+                }
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -3373,9 +3410,14 @@ impl Host {
         };
         let us = waiting.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        if let Some(times) = times {
+        if times.is_some() || backlog.is_some() {
             let gpu_ms = f.timestamps.as_ref().and_then(|stamps| stamps.read(&fence, sent));
-            relay_timing::record(gpu_ms, total, waiting, times);
+            if let Some(times) = times {
+                relay_timing::record(gpu_ms, total, waiting, times);
+            }
+            if let Some((completed_before, signalled_before)) = backlog {
+                tracing::info!(fetch = sent, completed_before, signalled_before, bytes = total, wall_us = us, ?gpu_ms, "queue profile readback");
+            }
         }
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
@@ -3465,6 +3507,23 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    #[cfg(feature = "diagnostics")]
+                    if queue_profile::enabled() {
+                        let mut samples = Vec::new();
+                        for list in &flight.lists {
+                            if let Some(recording) = list.host().profile_samples.get() {
+                                recording.lock().unwrap_or_else(|e| e.into_inner()).collect(&self.fence, flight.fence, &mut samples);
+                            }
+                        }
+                        if let Some(card) = &flight.card {
+                            for s in &card.profile_samples {
+                                s.collect(&self.fence, flight.fence, &mut samples);
+                            }
+                        }
+                        if !samples.is_empty() {
+                            tracing::info!(fence=flight.fence, submission=flight.number, ?samples, "queue profile flight");
+                        }
+                    }
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -4029,11 +4088,19 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            if queue_profile::enabled() {
+                for list in runs { list.profile_submit(Some(*submitted)); }
+            }
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            #[cfg(feature = "diagnostics")]
+            if queue_profile::enabled() && signalled.is_ok() {
+                queue_profile::LAST_TITLE_FENCE.store(*submitted, Ordering::Release);
+            }
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -4066,6 +4133,10 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        if queue_profile::enabled() {
+            for list in runs { list.profile_submit(None); }
+        }
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -4376,6 +4447,20 @@ impl Host {
 }
 
 impl HostList {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn profile_finish(&self, sample: Option<queue_profile::Sample>) {
+        if let Some(sample) = sample {
+            sample.finish(&self.list);
+            self.profile_samples.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()).samples.push(sample);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn profile_submit(&self, fence: Option<u64>) {
+        if let Some(recording) = self.profile_samples.get() {
+            recording.lock().unwrap_or_else(|e| e.into_inner()).submitted(fence);
+        }
+    }
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -4474,6 +4559,10 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(recording) = self.profile_samples.get() {
+            *recording.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();

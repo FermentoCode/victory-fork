@@ -1711,9 +1711,25 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let profile = self.profile_command(list, "title-dispatch", true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        list.profile_finish(profile);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn profile_command(&self, list: &HostList, class: &'static str, compute: bool) -> Option<crate::host::queue_profile::Sample> {
+        use crate::host::queue_profile::{Group, begin};
+        begin(&list.list, class, Group::Title, || {
+            let target = if compute { "compute" } else if self.depth != 0 && self.targets.iter().all(|&t| t == 0) {
+                "depth-only"
+            } else { "graphics" };
+            let shader = crate::pipeline::host_pipeline(self.pipeline as This).map_or("unknown", |p| p.name.as_str());
+            format!("{target} {shader}")
+        })
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1810,8 +1826,12 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    #[cfg(feature = "diagnostics")]
+                    let profile = self.profile_command(list, "title-mesh", false);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    list.profile_finish(profile);
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2139,11 +2159,15 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let profile = self.profile_command(list, "title-draw", false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            list.profile_finish(profile);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2240,11 +2264,15 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let profile = self.profile_command(list, "title-indexed", false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            list.profile_finish(profile);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2404,11 +2432,15 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                #[cfg(feature = "diagnostics")]
+                let profile = self.profile_command(list, "host-indirect-clamp", kind == DISPATCH);
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
+                #[cfg(feature = "diagnostics")]
+                list.profile_finish(profile);
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -2446,6 +2478,12 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let profile = self.profile_command(list, match kind {
+            DRAW => "title-indirect-draw", INDEXED => "title-indirect-indexed",
+            DISPATCH => "title-indirect-dispatch", MESH => "title-indirect-mesh",
+            _ => "title-indirect-other",
+        }, kind == DISPATCH);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -2458,6 +2496,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        list.profile_finish(profile);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

@@ -661,13 +661,23 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        for wide in [false, true] {
+            let Some(warp) = WarpHarness::new() else {
+                eprintln!("skipping card hash test: D3D12 WARP is unavailable");
+                return;
+            };
+            check_card_compare(warp, wide);
+            eprintln!("WARP verified dirty-piece flags (wide={wide})");
+        }
+    }
+
+    fn check_card_compare(mut warp: WarpHarness, wide: bool) {
+        let source = if wide { crate::card_hash::CARD_COMPARE_WIDE } else { crate::host::CARD_COMPARE };
+        let compare = compile_cs(&warp.device, source).expect("card compare must compile");
         const PIECE: usize = 64 << 10;
+        const SKEW: u32 = 256;
         const PIECES: u32 = 3;
-        let size = PIECE * PIECES as usize;
+        let size = PIECE * 2;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
@@ -685,12 +695,13 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
                 warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::card_hash::groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -718,6 +729,32 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+
+        // Reproduce the paired sign-bit edit reported on PR #71, then also
+        // exercise siblings in the 256-lane tree. These are the final loads
+        // in the full middle piece, at their first dword's high byte.
+        let middle = PIECE - SKEW as usize;
+        for offsets in [[64_512, 65_024], [61_440, 63_488]] {
+            for offset in offsets {
+                let i = middle + offset + 3;
+                // SAFETY: the queue is idle and the piece is inside this mapping.
+                unsafe { now_ptr.add(i).write_volatile(content[i] ^ 0x80) };
+            }
+            assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+            for offset in offsets {
+                let i = middle + offset + 3;
+                // SAFETY: the same two bytes after waiting for the compare.
+                unsafe { now_ptr.add(i).write_volatile(content[i]) };
+            }
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
+        // Both partial pieces and the full middle piece change together.
+        for i in [0, PIECE - SKEW as usize - 1, at, at + 128 * 16, size - 1] {
+            // SAFETY: each offset is within the live mapping, with the queue idle.
+            unsafe { now_ptr.add(i).write_volatile(content[i] ^ 0x80) };
+        }
+        assert_eq!(run(&mut warp, 2), [1, 1, 1]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
